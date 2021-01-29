@@ -33,5 +33,6 @@ fuse_target("ozz_animation_offline")
 
 add_subdirectory(fbx)
 add_subdirectory(gltf)
+add_subdirectory(gltf2)
 add_subdirectory(tools)
 
