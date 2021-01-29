@@ -1,0 +1,3 @@
+[submodule "src/animation/offline/gltf2/extern/cgltf"]
+	path = src/animation/offline/gltf2/extern/cgltf
+	url = https://github.com/infosia/cgltf.git
