@@ -351,7 +351,7 @@ CreateTranslationBindPoseKey(const cgltf_node& _node) {
   ozz::animation::offline::RawAnimation::TranslationKey key;
   key.time = 0.0f;
 
-  if (_node.translation.empty()) {
+  if (!_node.has_translation) {
     key.value = ozz::math::Float3::zero();
   } else {
     key.value = ozz::math::Float3(static_cast<float>(_node.translation[0]),
@@ -367,7 +367,7 @@ ozz::animation::offline::RawAnimation::RotationKey CreateRotationBindPoseKey(
   ozz::animation::offline::RawAnimation::RotationKey key;
   key.time = 0.0f;
 
-  if (_node.rotation.empty()) {
+  if (!_node.has_rotation) {
     key.value = ozz::math::Quaternion::identity();
   } else {
     key.value = ozz::math::Quaternion(static_cast<float>(_node.rotation[0]),
@@ -383,7 +383,7 @@ ozz::animation::offline::RawAnimation::ScaleKey CreateScaleBindPoseKey(
   ozz::animation::offline::RawAnimation::ScaleKey key;
   key.time = 0.0f;
 
-  if (_node.scale.empty()) {
+  if (!_node.has_scale) {
     key.value = ozz::math::Float3::one();
   } else {
     key.value = ozz::math::Float3(static_cast<float>(_node.scale[0]),
@@ -398,7 +398,7 @@ bool CreateNodeTransform(const cgltf_node& _node,
                          ozz::math::Transform* _transform) {
   *_transform = ozz::math::Transform::identity();
 
-  if (!_node.matrix.empty()) {
+  if (_node.has_matrix) {
     const ozz::math::Float4x4 matrix = {
         {ozz::math::simd_float4::Load(static_cast<float>(_node.matrix[0]),
                                       static_cast<float>(_node.matrix[1]),
@@ -419,8 +419,8 @@ bool CreateNodeTransform(const cgltf_node& _node,
     ozz::math::SimdFloat4 translation, rotation, scale;
     if (ToAffine(matrix, &translation, &rotation, &scale)) {
       ozz::math::Store3PtrU(translation, &_transform->translation.x);
-      ozz::math::StorePtrU(translation, &_transform->rotation.x);
-      ozz::math::Store3PtrU(translation, &_transform->scale.x);
+      ozz::math::StorePtrU(rotation, &_transform->rotation.x);
+      ozz::math::Store3PtrU(scale, &_transform->scale.x);
       return true;
     }
 
@@ -429,20 +429,20 @@ bool CreateNodeTransform(const cgltf_node& _node,
     return false;
   }
 
-  if (!_node.translation.empty()) {
+  if (_node.has_translation) {
     _transform->translation =
         ozz::math::Float3(static_cast<float>(_node.translation[0]),
                           static_cast<float>(_node.translation[1]),
                           static_cast<float>(_node.translation[2]));
   }
-  if (!_node.rotation.empty()) {
+  if (_node.has_rotation) {
     _transform->rotation =
         ozz::math::Quaternion(static_cast<float>(_node.rotation[0]),
                               static_cast<float>(_node.rotation[1]),
                               static_cast<float>(_node.rotation[2]),
                               static_cast<float>(_node.rotation[3]));
   }
-  if (!_node.scale.empty()) {
+  if (_node.has_scale) {
     _transform->scale = ozz::math::Float3(static_cast<float>(_node.scale[0]),
                                           static_cast<float>(_node.scale[1]),
                                           static_cast<float>(_node.scale[2]));
@@ -512,13 +512,13 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
 
   // Given a skin find which of its joints is the skeleton root and return it
   // returns -1 if the skin has no associated joints
-  int FindSkinRootJointIndex(const cgltf_skin& skin) {
-    if (skin.joints.empty()) {
+  int FindSkinRootJointIndex(const cgltf_skin* skin) {
+    if (skin.joints_count == 0) {
       return -1;
     }
 
-    if (skin.skeleton != -1) {
-      return skin.skeleton;
+    if (skin.skeleton != nullptr) {
+      return skin.skeleton_index;
     }
 
     ozz::map<int, int> parents;
@@ -540,7 +540,7 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
               const NodeType& _types) override {
     (void)_types;
 
-    if (m_model.scenes.empty()) {
+    if (m_model->scenes_count == 0) {
       ozz::log::Err() << "No scenes found." << std::endl;
       return false;
     }
@@ -548,30 +548,29 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
     // If no default scene has been set then take the first one spec does not
     // disallow gltfs without a default scene but it makes more sense to keep
     // going instead of throwing an error here
-    int defaultScene = m_model.defaultScene;
-    if (defaultScene == -1) {
-      defaultScene = 0;
+    cgltf_scene* scene = m_model->scene;
+    if (scene == nullptr) {
+      scene = &m_model->scenes[0];
     }
 
-    cgltf_scene& scene = m_model.scenes[defaultScene];
-    ozz::log::LogV() << "Importing from default scene #" << defaultScene
-                     << " with name \"" << scene.name << "\"." << std::endl;
+    ozz::log::LogV() << "Importing from default scene #" << scene
+                     << " with name \"" << scene->name << "\"." << std::endl;
 
-    if (scene.nodes.empty()) {
+    if (scene->nodes_count == 0) {
       ozz::log::Err() << "Scene has no node." << std::endl;
       return false;
     }
 
     // Get all the skins belonging to this scene
-    ozz::vector<int> roots;
-    ozz::vector<cgltf_skin> skins = GetSkinsForScene(scene);
+    ozz::vector<cgltf_node*> roots;
+    ozz::set<cgltf_skin*> skins = GetSkinsForScene(scene);
     if (skins.empty()) {
       ozz::log::Log() << "No skin exists in the scene, the whole scene graph "
                          "will be considered as a skeleton."
                       << std::endl;
       // Uses all scene nodes.
-      for (auto& node : scene.nodes) {
-        roots.push_back(node);
+      for (cgltf_size i = 0; i < scene->nodes_count; i++) {
+        roots.push_back(scene->nodes[i]);
       }
     } else {
       if (skins.size() > 1) {
@@ -581,7 +580,7 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
       }
 
       // Uses all skins root
-      for (auto& skin : skins) {
+      for (auto skin : skins) {
         const int root = FindSkinRootJointIndex(skin);
         if (root == -1) {
           continue;
@@ -619,7 +618,7 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   bool ImportNode(const cgltf_node& _node,
                   ozz::animation::offline::RawSkeleton::Joint* _joint) {
     // Names joint.
-    _joint->name = _node.name.c_str();
+    _joint->name = _node.name;
 
     // Fills transform.
     if (!CreateNodeTransform(_node, &_joint->transform)) {
@@ -627,15 +626,15 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
     }
 
     // Allocates all children at once.
-    _joint->children.resize(_node.children.size());
+    _joint->children.resize(_node.children_count);
 
     // Fills each child information.
-    for (size_t i = 0; i < _node.children.size(); ++i) {
-      const cgltf_node& child_node = m_model.nodes[_node.children[i]];
+    for (size_t i = 0; i < _node.children_count; ++i) {
+      const cgltf_node* child_node = _node.children[i];
       ozz::animation::offline::RawSkeleton::Joint& child_joint =
           _joint->children[i];
 
-      if (!ImportNode(child_node, &child_joint)) {
+      if (!ImportNode(*child_node, &child_joint)) {
         return false;
       }
     }
@@ -824,40 +823,24 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   }
 
   // Returns all skins belonging to a given gltf scene
-  ozz::vector<cgltf_skin> GetSkinsForScene(
-      const cgltf_scene& _scene) const {
-    ozz::set<int> open;
-    ozz::set<int> found;
-
-    for (int nodeIndex : _scene.nodes) {
-      open.insert(nodeIndex);
+  ozz::set<cgltf_skin*> GetSkinsForScene(
+      const cgltf_scene* _scene) const {
+    ozz::set<cgltf_skin*> skins;
+    for (cgltf_size i = 0; i < _scene->nodes_count; i++) {
+        const auto node = _scene->nodes[i];
+        if (node->skin != nullptr) {
+            skins.insert(node->skin);
+        }
     }
-
-    while (!open.empty()) {
-      int nodeIndex = *open.begin();
-      found.insert(nodeIndex);
-      open.erase(nodeIndex);
-
-      auto& node = m_model.nodes[nodeIndex];
-      for (int childIndex : node.children) {
-        open.insert(childIndex);
-      }
-    }
-
-    ozz::vector<cgltf_skin> skins;
-    for (const cgltf_skin& skin : m_model.skins) {
-      if (!skin.joints.empty() && found.find(skin.joints[0]) != found.end()) {
-        skins.push_back(skin);
-      }
-    }
-
     return skins;
   }
 
   const cgltf_node* FindNodeByName(const std::string& _name) const {
-    for (const cgltf_node& node : m_model.nodes) {
-      if (node.name == _name) {
-        return &node;
+    const auto name = _name.c_str();
+    for (cgltf_size i = 0; i < m_model->nodes_count; ++i) {
+      cgltf_node* node = &m_model->nodes[i];
+      if (strcmp(node->name, name) == 0) {
+        return node;
       }
     }
 
@@ -884,6 +867,8 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
               ozz::animation::offline::RawFloat4Track*) override {
     return false;
   }
+
+  cgltf_data* m_model;
 };
 
 int main(int _argc, const char** _argv) {
