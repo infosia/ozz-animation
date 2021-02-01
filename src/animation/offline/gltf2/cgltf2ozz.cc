@@ -34,9 +34,11 @@
 // https://github.com/guillaumeblanc/ozz-animation/pull/70                    //
 //----------------------------------------------------------------------------//
 
+#include <algorithm>
 #include <cassert>
 #include <cstring>
 #include <string>
+#include <codecvt>
 
 #include "ozz/animation/offline/raw_animation_utils.h"
 #include "ozz/animation/offline/tools/import2ozz.h"
@@ -54,6 +56,71 @@
 #include "extern/cgltf/cgltf.h"
 
 namespace {
+
+static cgltf_result wstring_file_read(
+    const struct cgltf_memory_options* memory_options,
+    const struct cgltf_file_options* file_options, const std::wstring path,
+    cgltf_size* size, void** data) {
+  (void)file_options;
+  void* (*memory_alloc)(void*, cgltf_size) =
+      memory_options->alloc ? memory_options->alloc : &cgltf_default_alloc;
+  void (*memory_free)(void*, void*) =
+      memory_options->free ? memory_options->free : &cgltf_default_free;
+
+  FILE* file = _wfopen(path.c_str(), L"rb");
+
+  if (!file) {
+    return cgltf_result_file_not_found;
+  }
+
+  cgltf_size file_size = size ? *size : 0;
+
+  if (file_size == 0) {
+    fseek(file, 0, SEEK_END);
+
+    long length = ftell(file);
+    if (length < 0) {
+      fclose(file);
+      return cgltf_result_io_error;
+    }
+
+    fseek(file, 0, SEEK_SET);
+    file_size = (cgltf_size)length;
+  }
+
+  char* file_data = (char*)memory_alloc(memory_options->user_data, file_size);
+  if (!file_data) {
+    fclose(file);
+    return cgltf_result_out_of_memory;
+  }
+
+  cgltf_size read_size = fread(file_data, 1, file_size, file);
+
+  fclose(file);
+
+  if (read_size != file_size) {
+    memory_free(memory_options->user_data, file_data);
+    return cgltf_result_io_error;
+  }
+
+  if (size) {
+    *size = file_size;
+  }
+  if (data) {
+    *data = file_data;
+  }
+
+  return cgltf_result_success;
+}
+
+static cgltf_result wstring_file_read(
+    const struct cgltf_memory_options* memory_options,
+    const struct cgltf_file_options* file_options, const char* path,
+    cgltf_size* size, void** data) {
+  std::wstring_convert<std::codecvt_utf8<wchar_t>> converter;
+  return wstring_file_read(memory_options, file_options,
+                           converter.from_bytes(path), size, data);
+}
 
 template <typename _VectorType>
 bool FixupNames(_VectorType& _data, const char* _pretty_name,
@@ -100,10 +167,12 @@ bool FixupNames(_VectorType& _data, const char* _pretty_name,
 // Returns the address of a gltf buffer given an accessor.
 // Performs basic checks to ensure the data is in the correct format
 template <typename T>
-ozz::span<const T> BufferView(const cgltf_data& _model,
-                              const cgltf_accessor& _accessor) {
-  const int32_t component_size = cgltf_component_size(_accessor.type, _accessor.component_type);
-  const int32_t element_size = cgltf_num_components(_accessor.type);
+ozz::span<const T> BufferView(const cgltf_data* _model,
+                              const cgltf_accessor* _accessor) {
+  (void)_model;
+  const auto component_size =
+      cgltf_component_size(_accessor->component_type);
+  const auto element_size = cgltf_num_components(_accessor->type);
   if (element_size != sizeof(T)) {
     ozz::log::Err() << "Invalid buffer view access. Expected element size '"
                     << sizeof(T) << " got " << element_size << " instead."
@@ -111,23 +180,22 @@ ozz::span<const T> BufferView(const cgltf_data& _model,
     return ozz::span<const T>();
   }
 
-  const cgltf_buffer_view& bufferView =
-      _model.bufferViews[_accessor.bufferView];
-  const cgltf_buffer& buffer = _model.buffers[bufferView.buffer];
+  const cgltf_buffer_view* buffer_view = _accessor->buffer_view;
+  const cgltf_buffer* buffer = buffer_view->buffer;
   const T* begin = reinterpret_cast<const T*>(
-      buffer.data.data() + bufferView.byteOffset + _accessor.byteOffset);
-  return ozz::span<const T>(begin, _accessor.count);
+      (T*)buffer->data + buffer_view->offset + _accessor->offset);
+  return ozz::span<const T>(begin, _accessor->count);
 }
 
 // Samples a linear animation channel
 // There is an exact mapping between gltf and ozz keyframes so we just copy
 // everything over.
 template <typename _KeyframesType>
-bool SampleLinearChannel(const cgltf_data& _model,
-                         const cgltf_accessor& _output,
+bool SampleLinearChannel(const cgltf_data* _model,
+                         const cgltf_accessor* _output,
                          const ozz::span<const float>& _timestamps,
                          _KeyframesType* _keyframes) {
-  const size_t gltf_keys_count = _output.count;
+  const size_t gltf_keys_count = _output->count;
 
   if (gltf_keys_count == 0) {
     _keyframes->clear();
@@ -144,8 +212,8 @@ bool SampleLinearChannel(const cgltf_data& _model,
     return false;
   }
 
-  _keyframes->reserve(_output.count);
-  for (size_t i = 0; i < _output.count; ++i) {
+  _keyframes->reserve(_output->count);
+  for (size_t i = 0; i < _output->count; ++i) {
     const typename _KeyframesType::value_type key{_timestamps[i], values[i]};
     _keyframes->push_back(key);
   }
@@ -156,11 +224,10 @@ bool SampleLinearChannel(const cgltf_data& _model,
 // Samples a step animation channel
 // There are twice-1 as many ozz keyframes as gltf keyframes
 template <typename _KeyframesType>
-bool SampleStepChannel(const cgltf_data& _model,
-                       const cgltf_accessor& _output,
+bool SampleStepChannel(const cgltf_data* _model, const cgltf_accessor* _output,
                        const ozz::span<const float>& _timestamps,
                        _KeyframesType* _keyframes) {
-  const size_t gltf_keys_count = _output.count;
+  const size_t gltf_keys_count = _output->count;
 
   if (gltf_keys_count == 0) {
     _keyframes->clear();
@@ -181,12 +248,12 @@ bool SampleStepChannel(const cgltf_data& _model,
   size_t numKeyframes = gltf_keys_count * 2 - 1;
   _keyframes->resize(numKeyframes);
 
-  for (size_t i = 0; i < _output.count; i++) {
+  for (size_t i = 0; i < _output->count; i++) {
     typename _KeyframesType::reference key = _keyframes->at(i * 2);
     key.time = _timestamps[i];
     key.value = values[i];
 
-    if (i < _output.count - 1) {
+    if (i < _output->count - 1) {
       typename _KeyframesType::reference next_key = _keyframes->at(i * 2 + 1);
       next_key.time = nexttowardf(_timestamps[i + 1], 0.f);
       next_key.value = values[i];
@@ -230,15 +297,15 @@ T SampleHermiteSpline(float _alpha, const T& p0, const T& m0, const T& p1,
 // the number of keyframes is determined from the animation duration and given
 // sample rate
 template <typename _KeyframesType>
-bool SampleCubicSplineChannel(const cgltf_data& _model,
-                              const cgltf_accessor& _output,
+bool SampleCubicSplineChannel(const cgltf_data* _model,
+                              const cgltf_accessor* _output,
                               const ozz::span<const float>& _timestamps,
                               float _sampling_rate, float _duration,
                               _KeyframesType* _keyframes) {
   (void)_duration;
 
-  assert(_output.count % 3 == 0);
-  size_t gltf_keys_count = _output.count / 3;
+  assert(_output->count % 3 == 0);
+  size_t gltf_keys_count = _output->count / 3;
 
   if (gltf_keys_count == 0) {
     _keyframes->clear();
@@ -293,18 +360,18 @@ bool SampleCubicSplineChannel(const cgltf_data& _model,
 }
 
 template <typename _KeyframesType>
-bool SampleChannel(const cgltf_data& _model,
-                   const std::string& _interpolation,
-                   const cgltf_accessor& _output,
+bool SampleChannel(const cgltf_data* _model,
+                   const cgltf_interpolation_type _interpolation,
+                   const cgltf_accessor* _output,
                    const ozz::span<const float>& _timestamps,
                    float _sampling_rate, float _duration,
                    _KeyframesType* _keyframes) {
   bool valid = false;
-  if (_interpolation == "LINEAR") {
+  if (_interpolation ==cgltf_interpolation_type_linear) {
     valid = SampleLinearChannel(_model, _output, _timestamps, _keyframes);
-  } else if (_interpolation == "STEP") {
+  } else if (_interpolation == cgltf_interpolation_type_step) {
     valid = SampleStepChannel(_model, _output, _timestamps, _keyframes);
-  } else if (_interpolation == "CUBICSPLINE") {
+  } else if (_interpolation == cgltf_interpolation_type_cubic_spline) {
     valid = SampleCubicSplineChannel(_model, _output, _timestamps,
                                      _sampling_rate, _duration, _keyframes);
   } else {
@@ -347,75 +414,75 @@ bool SampleChannel(const cgltf_data& _model,
 }
 
 ozz::animation::offline::RawAnimation::TranslationKey
-CreateTranslationBindPoseKey(const cgltf_node& _node) {
+CreateTranslationBindPoseKey(const cgltf_node* _node) {
   ozz::animation::offline::RawAnimation::TranslationKey key;
   key.time = 0.0f;
 
-  if (!_node.has_translation) {
+  if (!_node->has_translation) {
     key.value = ozz::math::Float3::zero();
   } else {
-    key.value = ozz::math::Float3(static_cast<float>(_node.translation[0]),
-                                  static_cast<float>(_node.translation[1]),
-                                  static_cast<float>(_node.translation[2]));
+    key.value = ozz::math::Float3(static_cast<float>(_node->translation[0]),
+                                  static_cast<float>(_node->translation[1]),
+                                  static_cast<float>(_node->translation[2]));
   }
 
   return key;
 }
 
 ozz::animation::offline::RawAnimation::RotationKey CreateRotationBindPoseKey(
-    const cgltf_node& _node) {
+    const cgltf_node* _node) {
   ozz::animation::offline::RawAnimation::RotationKey key;
   key.time = 0.0f;
 
-  if (!_node.has_rotation) {
+  if (!_node->has_rotation) {
     key.value = ozz::math::Quaternion::identity();
   } else {
-    key.value = ozz::math::Quaternion(static_cast<float>(_node.rotation[0]),
-                                      static_cast<float>(_node.rotation[1]),
-                                      static_cast<float>(_node.rotation[2]),
-                                      static_cast<float>(_node.rotation[3]));
+    key.value = ozz::math::Quaternion(static_cast<float>(_node->rotation[0]),
+                                      static_cast<float>(_node->rotation[1]),
+                                      static_cast<float>(_node->rotation[2]),
+                                      static_cast<float>(_node->rotation[3]));
   }
   return key;
 }
 
 ozz::animation::offline::RawAnimation::ScaleKey CreateScaleBindPoseKey(
-    const cgltf_node& _node) {
+    const cgltf_node* _node) {
   ozz::animation::offline::RawAnimation::ScaleKey key;
   key.time = 0.0f;
 
-  if (!_node.has_scale) {
+  if (!_node->has_scale) {
     key.value = ozz::math::Float3::one();
   } else {
-    key.value = ozz::math::Float3(static_cast<float>(_node.scale[0]),
-                                  static_cast<float>(_node.scale[1]),
-                                  static_cast<float>(_node.scale[2]));
+    key.value = ozz::math::Float3(static_cast<float>(_node->scale[0]),
+                                  static_cast<float>(_node->scale[1]),
+                                  static_cast<float>(_node->scale[2]));
   }
   return key;
 }
 
 // Creates the default transform for a gltf node
-bool CreateNodeTransform(const cgltf_node& _node,
+bool CreateNodeTransform(const cgltf_node* _node,
                          ozz::math::Transform* _transform) {
   *_transform = ozz::math::Transform::identity();
 
-  if (_node.has_matrix) {
+  if (_node->has_matrix) {
     const ozz::math::Float4x4 matrix = {
-        {ozz::math::simd_float4::Load(static_cast<float>(_node.matrix[0]),
-                                      static_cast<float>(_node.matrix[1]),
-                                      static_cast<float>(_node.matrix[2]),
-                                      static_cast<float>(_node.matrix[3])),
-         ozz::math::simd_float4::Load(static_cast<float>(_node.matrix[4]),
-                                      static_cast<float>(_node.matrix[5]),
-                                      static_cast<float>(_node.matrix[6]),
-                                      static_cast<float>(_node.matrix[7])),
-         ozz::math::simd_float4::Load(static_cast<float>(_node.matrix[8]),
-                                      static_cast<float>(_node.matrix[9]),
-                                      static_cast<float>(_node.matrix[10]),
-                                      static_cast<float>(_node.matrix[11])),
-         ozz::math::simd_float4::Load(static_cast<float>(_node.matrix[12]),
-                                      static_cast<float>(_node.matrix[13]),
-                                      static_cast<float>(_node.matrix[14]),
-                                      static_cast<float>(_node.matrix[15]))}};
+        {ozz::math::simd_float4::Load(static_cast<float>(_node->matrix[0]),
+                                      static_cast<float>(_node->matrix[1]),
+                                      static_cast<float>(_node->matrix[2]),
+                                      static_cast<float>(_node->matrix[3])),
+         ozz::math::simd_float4::Load(static_cast<float>(_node->matrix[4]),
+                                      static_cast<float>(_node->matrix[5]),
+                                      static_cast<float>(_node->matrix[6]),
+                                      static_cast<float>(_node->matrix[7])),
+         ozz::math::simd_float4::Load(static_cast<float>(_node->matrix[8]),
+                                      static_cast<float>(_node->matrix[9]),
+                                      static_cast<float>(_node->matrix[10]),
+                                      static_cast<float>(_node->matrix[11])),
+         ozz::math::simd_float4::Load(static_cast<float>(_node->matrix[12]),
+                                      static_cast<float>(_node->matrix[13]),
+                                      static_cast<float>(_node->matrix[14]),
+                                      static_cast<float>(_node->matrix[15]))}};
     ozz::math::SimdFloat4 translation, rotation, scale;
     if (ToAffine(matrix, &translation, &rotation, &scale)) {
       ozz::math::Store3PtrU(translation, &_transform->translation.x);
@@ -425,27 +492,27 @@ bool CreateNodeTransform(const cgltf_node& _node,
     }
 
     ozz::log::Err() << "Failed to extract transformation from node \""
-                    << _node.name << "\"." << std::endl;
+                    << _node->name << "\"." << std::endl;
     return false;
   }
 
-  if (_node.has_translation) {
+  if (_node->has_translation) {
     _transform->translation =
-        ozz::math::Float3(static_cast<float>(_node.translation[0]),
-                          static_cast<float>(_node.translation[1]),
-                          static_cast<float>(_node.translation[2]));
+        ozz::math::Float3(static_cast<float>(_node->translation[0]),
+                          static_cast<float>(_node->translation[1]),
+                          static_cast<float>(_node->translation[2]));
   }
-  if (_node.has_rotation) {
+  if (_node->has_rotation) {
     _transform->rotation =
-        ozz::math::Quaternion(static_cast<float>(_node.rotation[0]),
-                              static_cast<float>(_node.rotation[1]),
-                              static_cast<float>(_node.rotation[2]),
-                              static_cast<float>(_node.rotation[3]));
+        ozz::math::Quaternion(static_cast<float>(_node->rotation[0]),
+                              static_cast<float>(_node->rotation[1]),
+                              static_cast<float>(_node->rotation[2]),
+                              static_cast<float>(_node->rotation[3]));
   }
-  if (_node.has_scale) {
-    _transform->scale = ozz::math::Float3(static_cast<float>(_node.scale[0]),
-                                          static_cast<float>(_node.scale[1]),
-                                          static_cast<float>(_node.scale[2]));
+  if (_node->has_scale) {
+    _transform->scale = ozz::math::Float3(static_cast<float>(_node->scale[0]),
+                                          static_cast<float>(_node->scale[1]),
+                                          static_cast<float>(_node->scale[2]));
   }
 
   return true;
@@ -454,81 +521,45 @@ bool CreateNodeTransform(const cgltf_node& _node,
 
 class GltfImporter : public ozz::animation::offline::OzzImporter {
  public:
-  GltfImporter() {
-    // We don't care about image data but we have to provide this callback
-    // because we're not loading the stb library
-    auto image_loader = [](cgltf_image*, const int, std::string*,
-                           std::string*, int, int, const unsigned char*, int,
-                           void*) { return true; };
-    m_loader.SetImageLoader(image_loader, NULL);
-  }
+  GltfImporter() {}
 
  private:
   bool Load(const char* _filename) override {
-    bool success = false;
-    std::string errors;
-    std::string warnings;
+    cgltf_options parse_options = {};
+    parse_options.file.read = &wstring_file_read;
 
-    // Finds file extension.
-    const char* separator = std::strrchr(_filename, '.');
-    const char* ext = separator != NULL ? separator + 1 : "";
+    const auto success = cgltf_parse_file(&parse_options, _filename,
+                                          &m_model) == cgltf_result_success;
 
-    // Tries to guess whether the input is a gltf json or a glb binary based on
-    // the file extension
-    if (std::strcmp(ext, "glb") == 0) {
-      success =
-          m_loader.LoadBinaryFromFile(&m_model, &errors, &warnings, _filename);
+    if (success) {
+      ozz::log::Err() << "glTF parsing errors with " << success << std::endl;
     } else {
-      if (std::strcmp(ext, "gltf") != 0) {
-        ozz::log::Log() << "Unknown file extension '" << ext
-                        << "', assuming a JSON-formatted gltf." << std::endl;
-      }
-
-      success =
-          m_loader.LoadASCIIFromFile(&m_model, &errors, &warnings, _filename);
-    }
-
-    // Prints any errors or warnings emitted by the loader
-    if (!warnings.empty()) {
-      ozz::log::Log() << "glTF parsing warnings: " << warnings << std::endl;
-    }
-
-    if (!errors.empty()) {
-      ozz::log::Err() << "glTF parsing errors: " << errors << std::endl;
-    }
-
-    if (success) {
       ozz::log::Log() << "glTF parsed successfully." << std::endl;
-    }
-
-    if (success) {
-      success &= FixupNames(m_model.scenes, "Scene", "scene_");
-      success &= FixupNames(m_model.nodes, "Node", "node_");
-      success &= FixupNames(m_model.animations, "Animation", "animation_");
     }
 
     return success;
   }
 
   // Given a skin find which of its joints is the skeleton root and return it
-  // returns -1 if the skin has no associated joints
-  int FindSkinRootJointIndex(const cgltf_skin* skin) {
-    if (skin.joints_count == 0) {
-      return -1;
+  // returns nullptr if the skin has no associated joints
+  cgltf_node* FindSkinRootJoint(const cgltf_skin* skin) {
+    if (skin->joints_count == 0) {
+      return nullptr;
     }
 
-    if (skin.skeleton != nullptr) {
-      return skin.skeleton_index;
+    if (skin->skeleton != nullptr) {
+      return skin->skeleton;
     }
 
-    ozz::map<int, int> parents;
-    for (int node : skin.joints) {
-      for (int child : m_model.nodes[node].children) {
-        parents[child] = node;
+    ozz::map<cgltf_node*, cgltf_node*> parents;
+    for (cgltf_size i = 0; i < skin->joints_count; i++) {
+      auto node = skin->joints[i];
+      for (cgltf_size j = 0; j < node->children_count; j++) {
+        parents[node->children[j]] = node;
       }
     }
 
-    int root = skin.joints[0];
+    auto root = skin->joints[0];
     while (parents.find(root) != parents.end()) {
       root = parents[root];
     }
@@ -581,8 +612,8 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
 
       // Uses all skins root
       for (auto skin : skins) {
-        const int root = FindSkinRootJointIndex(skin);
-        if (root == -1) {
+        cgltf_node* root = FindSkinRootJoint(skin);
+        if (root == nullptr) {
           continue;
         }
         roots.push_back(root);
@@ -596,7 +627,7 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
     // Traverses the scene graph and record all joints starting from the roots.
     _skeleton->roots.resize(roots.size());
     for (size_t i = 0; i < roots.size(); ++i) {
-      const cgltf_node& root_node = m_model.nodes[roots[i]];
+      const cgltf_node* root_node = roots[i];
       ozz::animation::offline::RawSkeleton::Joint& root_joint =
           _skeleton->roots[i];
       if (!ImportNode(root_node, &root_joint)) {
@@ -615,10 +646,10 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   }
 
   // Recursively import a node's children
-  bool ImportNode(const cgltf_node& _node,
+  bool ImportNode(const cgltf_node* _node,
                   ozz::animation::offline::RawSkeleton::Joint* _joint) {
     // Names joint.
-    _joint->name = _node.name;
+    _joint->name = _node->name;
 
     // Fills transform.
     if (!CreateNodeTransform(_node, &_joint->transform)) {
@@ -626,15 +657,15 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
     }
 
     // Allocates all children at once.
-    _joint->children.resize(_node.children_count);
+    _joint->children.resize(_node->children_count);
 
     // Fills each child information.
-    for (size_t i = 0; i < _node.children_count; ++i) {
-      const cgltf_node* child_node = _node.children[i];
+    for (size_t i = 0; i < _node->children_count; ++i) {
+      const cgltf_node* child_node = _node->children[i];
       ozz::animation::offline::RawSkeleton::Joint& child_joint =
           _joint->children[i];
 
-      if (!ImportNode(*child_node, &child_joint)) {
+      if (!ImportNode(child_node, &child_joint)) {
         return false;
       }
     }
@@ -645,10 +676,10 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   // Returns all animations in the gltf document.
   AnimationNames GetAnimationNames() override {
     AnimationNames animNames;
-    for (size_t i = 0; i < m_model.animations.size(); ++i) {
-      cgltf_animation& animation = m_model.animations[i];
-      assert(animation.name.length() != 0);
-      animNames.push_back(animation.name.c_str());
+    for (cgltf_size i = 0; i < m_model->animations_count; ++i) {
+      cgltf_animation* animation = &m_model->animations[i];
+      assert(animation->name != nullptr);
+      animNames.push_back(animation->name);
     }
 
     return animNames;
@@ -672,14 +703,16 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
     }
 
     // Find the corresponding gltf animation
-    std::vector<cgltf_animation>::const_iterator gltf_animation =
-        std::find_if(begin(m_model.animations), end(m_model.animations),
-                     [_animation_name](const cgltf_animation& _animation) {
-                       return _animation.name == _animation_name;
-                     });
-    assert(gltf_animation != end(m_model.animations));
+    cgltf_animation* gltf_animation = nullptr;
+    for (cgltf_size i = 0; i < m_model->animations_count; i++) {
+      auto animation = &m_model->animations[i];
+      if (strcmp(animation->name, _animation_name) == 0) {
+        gltf_animation = animation;
+      }
+    }
+    assert(gltf_animation != nullptr);
 
-    _animation->name = gltf_animation->name.c_str();
+    _animation->name = gltf_animation->name;
 
     // Animation duration is determined during sampling from the duration of the
     // longest channel
@@ -692,37 +725,33 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
     // where each channel targets a node's property i.e. translation, rotation
     // or scale. ozz expects animations to be stored per joint so we create a
     // map where we record the associated channels for each joint
-    ozz::cstring_map<std::vector<const cgltf_animationChannel*>>
+    ozz::cstring_map<std::vector<const cgltf_animation_channel*>>
         channels_per_joint;
 
-    for (const cgltf_animationChannel& channel : gltf_animation->channels) {
+    for (cgltf_size i = 0; i < gltf_animation->channels_count; i++) {
+      const cgltf_animation_channel* channel = &gltf_animation->channels[i];
       // Reject if no node is targetted.
-      if (channel.target_node == -1) {
+      if (channel->target_node == nullptr) {
         continue;
       }
 
       // Reject if path isn't about skeleton animation.
-      bool valid_target = false;
-      for (const char* path : {"translation", "rotation", "scale"}) {
-        valid_target |= channel.target_path == path;
-      }
-      if (!valid_target) {
+      if (channel->target_path == cgltf_animation_path_type_invalid) {
         continue;
       }
 
-      const cgltf_node& target_node = m_model.nodes[channel.target_node];
-      channels_per_joint[target_node.name.c_str()].push_back(&channel);
+      channels_per_joint[channel->target_node->name].push_back(channel);
     }
 
     // For each joint get all its associated channels, sample them and record
     // the samples in the joint track
     const ozz::span<const char* const> joint_names = skeleton.joint_names();
     for (int i = 0; i < num_joints; i++) {
-      auto& channels = channels_per_joint[joint_names[i]];
+      auto channels = channels_per_joint[joint_names[i]];
       auto& track = _animation->tracks[i];
 
-      for (auto& channel : channels) {
-        auto& sampler = gltf_animation->samplers[channel->sampler];
+      for (auto channel : channels) {
+        auto sampler = channel->sampler;
         if (!SampleAnimationChannel(m_model, sampler, channel->target_path,
                                     _sampling_rate, &_animation->duration,
                                     &track)) {
@@ -736,13 +765,13 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
       // Pads the bind pose transform for any joints which do not have an
       // associated channel for this animation
       if (track.translations.empty()) {
-        track.translations.push_back(CreateTranslationBindPoseKey(*node));
+        track.translations.push_back(CreateTranslationBindPoseKey(node));
       }
       if (track.rotations.empty()) {
-        track.rotations.push_back(CreateRotationBindPoseKey(*node));
+        track.rotations.push_back(CreateRotationBindPoseKey(node));
       }
       if (track.scales.empty()) {
-        track.scales.push_back(CreateScaleBindPoseKey(*node));
+        track.scales.push_back(CreateScaleBindPoseKey(node));
       }
     }
 
@@ -761,23 +790,18 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   }
 
   bool SampleAnimationChannel(
-      const cgltf_data& _model, const cgltf_animation_sampler& _sampler,
-      const std::string& _target_path, float _sampling_rate, float* _duration,
+      const cgltf_data* _model, const cgltf_animation_sampler* _sampler,
+      const cgltf_animation_path_type _target_path, float _sampling_rate,
+      float* _duration,
       ozz::animation::offline::RawAnimation::JointTrack* _track) {
-    // Validate interpolation type.
-    if (_sampler.interpolation.empty()) {
-      ozz::log::Err() << "Invalid sampler interpolation." << std::endl;
-      return false;
-    }
-
-    auto& input = m_model.accessors[_sampler.input];
-    assert(input.maxValues.size() == 1);
+    auto input = _sampler->input;
+    assert(input->has_max == 1);
 
     // The max[0] property of the input accessor is the animation duration
     // this is required to be present by the spec:
     // "Animation Sampler's input accessor must have min and max properties
     // defined."
-    const float duration = static_cast<float>(input.maxValues[0]);
+    const float duration = static_cast<float>(input->max[0]);
 
     // If this channel's duration is larger than the animation's duration
     // then increase the animation duration to match.
@@ -785,10 +809,10 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
       *_duration = duration;
     }
 
-    assert(input.type == TINYGLTF_TYPE_SCALAR);
-    auto& _output = m_model.accessors[_sampler.output];
-    assert(_output.type == TINYGLTF_TYPE_VEC3 ||
-           _output.type == TINYGLTF_TYPE_VEC4);
+    assert(input->type == cgltf_type_scalar);
+    auto _output = _sampler->output;
+    assert(_output->type == cgltf_type_vec3 ||
+           _output->type == cgltf_type_vec4);
 
     const ozz::span<const float> timestamps = BufferView<float>(_model, input);
     if (timestamps.empty()) {
@@ -797,13 +821,13 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
 
     // Builds keyframes.
     bool valid = false;
-    if (_target_path == "translation") {
+    if (_target_path == cgltf_animation_path_type_translation) {
       valid =
-          SampleChannel(m_model, _sampler.interpolation, _output, timestamps,
+          SampleChannel(m_model, _sampler->interpolation, _output, timestamps,
                         _sampling_rate, duration, &_track->translations);
-    } else if (_target_path == "rotation") {
+    } else if (_target_path == cgltf_animation_path_type_rotation) {
       valid =
-          SampleChannel(m_model, _sampler.interpolation, _output, timestamps,
+          SampleChannel(m_model, _sampler->interpolation, _output, timestamps,
                         _sampling_rate, duration, &_track->rotations);
       if (valid) {
         // Normalize quaternions.
@@ -811,9 +835,9 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
           key.value = ozz::math::Normalize(key.value);
         }
       }
-    } else if (_target_path == "scale") {
+    } else if (_target_path == cgltf_animation_path_type_scale) {
       valid =
-          SampleChannel(m_model, _sampler.interpolation, _output, timestamps,
+          SampleChannel(m_model, _sampler->interpolation, _output, timestamps,
                         _sampling_rate, duration, &_track->scales);
     } else {
       assert(false && "Invalid target path");
@@ -823,14 +847,13 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   }
 
   // Returns all skins belonging to a given gltf scene
-  ozz::set<cgltf_skin*> GetSkinsForScene(
-      const cgltf_scene* _scene) const {
+  ozz::set<cgltf_skin*> GetSkinsForScene(const cgltf_scene* _scene) const {
     ozz::set<cgltf_skin*> skins;
     for (cgltf_size i = 0; i < _scene->nodes_count; i++) {
-        const auto node = _scene->nodes[i];
-        if (node->skin != nullptr) {
-            skins.insert(node->skin);
-        }
+      const auto node = _scene->nodes[i];
+      if (node->skin != nullptr) {
+        skins.insert(node->skin);
+      }
     }
     return skins;
   }
