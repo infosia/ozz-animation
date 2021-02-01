@@ -518,6 +518,8 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
         renamed = true;
         name = _prefix_name;
         name += std::to_string(i);
+      } else {
+        name = data.name;
       }
 
       // Fixes duplicated names, while it has duplicates
