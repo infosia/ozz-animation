@@ -122,48 +122,6 @@ static cgltf_result wstring_file_read(
                            converter.from_bytes(path), size, data);
 }
 
-template <typename _VectorType>
-bool FixupNames(_VectorType& _data, const char* _pretty_name,
-                const char* _prefix_name) {
-  ozz::set<std::string> names;
-  for (size_t i = 0; i < _data.size(); ++i) {
-    bool renamed = false;
-    typename _VectorType::const_reference data = _data[i];
-
-    std::string name(data.name.c_str());
-
-    // Fixes unnamed animations.
-    if (name.length() == 0) {
-      renamed = true;
-      name = _prefix_name;
-      name += std::to_string(i);
-    }
-
-    // Fixes duplicated names, while it has duplicates
-    for (auto it = names.find(name); it != names.end(); it = names.find(name)) {
-      renamed = true;
-      name += "_";
-      name += std::to_string(i);
-    }
-
-    // Update names index.
-    if (!names.insert(name).second) {
-      assert(false && "Algorithm must ensure no duplicated animation names.");
-    }
-
-    if (renamed) {
-      ozz::log::LogV() << _pretty_name << " #" << i << " with name \""
-                       << data.name << "\" was renamed to \"" << name
-                       << "\" in order to avoid duplicates." << std::endl;
-
-      // Actually renames tinygltf data.
-      _data[i].name = name;
-    }
-  }
-
-  return true;
-}
-
 // Returns the address of a gltf buffer given an accessor.
 // Performs basic checks to ensure the data is in the correct format
 template <typename T>
@@ -532,12 +490,59 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
                                           &m_model) == cgltf_result_success;
 
     if (success) {
-      ozz::log::Err() << "glTF parsing errors with " << success << std::endl;
-    } else {
       ozz::log::Log() << "glTF parsed successfully." << std::endl;
+      FixupNames(m_model->scenes, m_model->scenes_count, "Scene", "scene_");
+      FixupNames(m_model->nodes, m_model->nodes_count, "Node", "node_");
+      FixupNames(m_model->animations, m_model->animations_count, "Animation", "animation_");
+
+    } else {
+      ozz::log::Err() << "glTF parsing errors with " << success << std::endl;
     }
 
     return success;
+  }
+
+  template <typename _VectorType>
+  bool FixupNames(_VectorType& _data, cgltf_size _data_count,
+                  const char* _pretty_name, const char* _prefix_name) {
+    ozz::set<std::string> names;
+
+    for (cgltf_size i = 0; i < _data_count; ++i) {
+      bool renamed = false;
+      auto data = _data[i];
+
+      std::string name;
+
+      // Fixes unnamed animations.
+      if (data.name == nullptr || strlen(data.name) == 0) {
+        renamed = true;
+        name = _prefix_name;
+        name += std::to_string(i);
+      }
+
+      // Fixes duplicated names, while it has duplicates
+      for (auto it = names.find(name); it != names.end();
+           it = names.find(name)) {
+        renamed = true;
+        name += "_";
+        name += std::to_string(i);
+      }
+
+      // Update names index.
+      if (!names.insert(name).second) {
+        assert(false && "Algorithm must ensure no duplicated animation names.");
+      }
+
+      if (renamed) {
+        ozz::log::LogV() << _pretty_name << " #" << i << " with name \""
+                         << (data.name?data.name:"(EMPTY)") << "\" was renamed to \"" << name
+                         << "\" in order to avoid duplicates." << std::endl;
+        const auto cached = fixup_names.insert(name); // save chars
+        _data[i].name =  const_cast<char*>(cached.first->c_str());
+      }
+    }
+
+    return true;
   }
 
   // Given a skin find which of its joints is the skeleton root and return it
@@ -892,6 +897,8 @@ class GltfImporter : public ozz::animation::offline::OzzImporter {
   }
 
   cgltf_data* m_model;
+  ozz::set<std::string> fixup_names;
+
 };
 
 int main(int _argc, const char** _argv) {
